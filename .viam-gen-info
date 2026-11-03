@@ -1,0 +1,13 @@
+{
+  "module_name": "teleop",
+  "visibility": "public",
+  "namespace": "viam",
+  "language": "go",
+  "resource_type": "service",
+  "resource_subtype": "generic",
+  "model_name": "leader-follower",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-11-03T16:41:26.898694Z",
+  "module_readme_link": "README.md"
+}
