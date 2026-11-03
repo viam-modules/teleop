@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "viam:teleop",
   "visibility": "public",
-  "url": "",
+  "url": "https://github.com/viam-modules/teleop",
   "description": "Arm teleoperation services: leader-follower (a leader arm's end-effector pose mirrored onto any arm through the motion service teleop pipeline)",
   "markdown_link": "README.md",
   "entrypoint": "bin/teleop",
@@ -22,7 +22,7 @@
     {
       "api": "rdk:service:generic",
       "model": "viam:teleop:leader-follower",
-      "short_description": "Mirror a leader arm's end-effector pose onto a follower arm of different kinematics through the builtin motion service teleop pipeline",
+      "short_description": "Mirror a leader arm's end-effector pose onto any follower arm through the motion teleop pipeline",
       "markdown_link": "docs/leader-follower.md"
     }
   ]
