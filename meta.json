@@ -3,7 +3,7 @@
   "module_id": "viam:teleop",
   "visibility": "public",
   "url": "",
-  "description": "Modular generic service: leader-follower",
+  "description": "Arm teleoperation services: leader-follower (a leader arm's end-effector pose mirrored onto any arm through the motion service teleop pipeline)",
   "markdown_link": "README.md",
   "entrypoint": "bin/teleop",
   "first_run": "",
@@ -14,7 +14,16 @@
     "arch": [
       "linux/amd64",
       "linux/arm64",
-      "darwin/arm64"
+      "darwin/arm64",
+      "windows/amd64"
     ]
-  }
+  },
+  "models": [
+    {
+      "api": "rdk:service:generic",
+      "model": "viam:teleop:leader-follower",
+      "short_description": "Mirror a leader arm's end-effector pose onto a follower arm of different kinematics through the builtin motion service teleop pipeline",
+      "markdown_link": "docs/leader-follower.md"
+    }
+  ]
 }

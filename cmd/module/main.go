@@ -1,13 +1,14 @@
+// Command module is the viam:teleop module entrypoint.
 package main
 
 import (
-	"teleop"
 	"go.viam.com/rdk/module"
 	"go.viam.com/rdk/resource"
-	generic "go.viam.com/rdk/services/generic"
+	"go.viam.com/rdk/services/generic"
+
+	"teleop/services/leaderfollower"
 )
 
 func main() {
-	// ModularMain can take multiple APIModel arguments, if your module implements multiple models.
-	module.ModularMain(resource.APIModel{ generic.API, teleop.LeaderFollower})
+	module.ModularMain(resource.APIModel{API: generic.API, Model: leaderfollower.Model})
 }

@@ -9,8 +9,10 @@ ifeq ($(VIAM_TARGET_OS), windows)
 	MODULE_BINARY = bin/teleop.exe
 endif
 
-$(MODULE_BINARY): Makefile go.mod *.go cmd/module/*.go 
-	GOOS=$(VIAM_BUILD_OS) GOARCH=$(VIAM_BUILD_ARCH) $(GO_BUILD_ENV) go build $(GO_BUILD_FLAGS) -o $(MODULE_BINARY) cmd/module/main.go
+GO_SRC := $(shell find cmd internal services -name '*.go')
+
+$(MODULE_BINARY): Makefile go.mod $(GO_SRC)
+	GOOS=$(VIAM_BUILD_OS) GOARCH=$(VIAM_BUILD_ARCH) $(GO_BUILD_ENV) go build $(GO_BUILD_FLAGS) -o $(MODULE_BINARY) ./cmd/module
 
 lint:
 	gofmt -s -w .

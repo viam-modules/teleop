@@ -1,0 +1,38 @@
+{
+  "scale": 2.5,
+  "leader_tool_offset_mm": { "x": 0, "y": 0, "z": 96 },
+  "origin_orientation": { "type": "ov_degrees", "value": { "x": 0, "y": 0, "z": 1, "th": 0 } },
+  "rotation_enabled": true,
+  "align_on_start": true,
+  "leader_hold": "manual",
+  "leader_gripper_commands": {
+    "on_start": [ { "command": "set_torque", "enable": false } ]
+  },
+  "leader_gripper_read_command": { "command": "get_position" },
+  "leader_gripper_read_key": "position_percentage",
+  "follower_gripper_mode": "command",
+  "follower_gripper_command": { "set": "$steps" },
+  "gripper_range": 850,
+  "gripper_invert": false,
+  "rate_hz": 60,
+  "smooth_tau_ms": 100,
+  "pos_deadzone_mm": 1,
+  "rot_deadzone_deg": 1,
+  "pairs": [
+    {
+      "name": "left",
+      "leader_arm": "left-leader-arm",
+      "leader_gripper": "left-leader-gripper",
+      "follower_component": "left-gripper",
+      "follower_gripper": "left-gripper",
+      "origin_translation_mm": { "x": 0, "y": 1003, "z": 0 }
+    },
+    {
+      "name": "right",
+      "leader_arm": "right-leader-arm",
+      "leader_gripper": "right-leader-gripper",
+      "follower_component": "right-gripper",
+      "follower_gripper": "right-gripper"
+    }
+  ]
+}
