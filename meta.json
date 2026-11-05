@@ -22,7 +22,7 @@
     {
       "api": "rdk:service:generic",
       "model": "viam:teleop:clutch",
-      "short_description": "Drive a follower arm from a pose tracker body or a leader arm only while a clutch control (grip, foot pedal) is held",
+      "short_description": "Drag a follower arm with a leader arm or pose tracker, between start and stop DoCommands",
       "markdown_link": "README.md#model-viamteleopclutch"
     },
     {
