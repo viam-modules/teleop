@@ -8,6 +8,7 @@ package testfake
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"sync"
 	"testing"
@@ -18,6 +19,8 @@ import (
 	"go.viam.com/rdk/components/arm"
 	"go.viam.com/rdk/components/arm/kinematics"
 	"go.viam.com/rdk/components/gripper"
+	"go.viam.com/rdk/components/posetracker"
+	"go.viam.com/rdk/components/sensor"
 	"go.viam.com/rdk/referenceframe"
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/motion"
@@ -213,6 +216,8 @@ type Motion struct {
 	// MoveErr fails every teleop_move; MoveWait, if set, blocks teleop_move until closed.
 	MoveErr  error
 	MoveWait chan struct{}
+	// StartErr fails every teleop_start.
+	StartErr error
 	// StatusErr is what teleop_status reports as the pipeline's error.
 	StatusErr string
 }
@@ -242,6 +247,13 @@ func (m *Motion) SetStatusError(e string) {
 	m.mu.Unlock()
 }
 
+// SetStartError makes every subsequent teleop_start fail with err.
+func (m *Motion) SetStartError(err error) {
+	m.mu.Lock()
+	m.StartErr = err
+	m.mu.Unlock()
+}
+
 // SetMoveError makes every subsequent teleop_move fail with err.
 func (m *Motion) SetMoveError(err error) {
 	m.mu.Lock()
@@ -251,6 +263,12 @@ func (m *Motion) SetMoveError(err error) {
 
 func (m *Motion) DoCommand(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
 	if s, ok := cmd["teleop_start"].(string); ok {
+		m.mu.Lock()
+		startErr := m.StartErr
+		m.mu.Unlock()
+		if startErr != nil {
+			return nil, startErr
+		}
 		var req pb.MoveRequest
 		if err := protojson.Unmarshal([]byte(s), &req); err != nil {
 			return nil, err
@@ -308,6 +326,17 @@ func (m *Motion) LastMove() spatialmath.Pose {
 		return nil
 	}
 	return referenceframe.ProtobufToPoseInFrame(m.Moves[len(m.Moves)-1]).Pose()
+}
+
+// MovePoses returns every accepted teleop_move pose, in order.
+func (m *Motion) MovePoses() []spatialmath.Pose {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]spatialmath.Pose, len(m.Moves))
+	for i, pif := range m.Moves {
+		out[i] = referenceframe.ProtobufToPoseInFrame(pif).Pose()
+	}
+	return out
 }
 
 // MoveCount is how many teleop_moves were accepted.
@@ -419,4 +448,134 @@ func (g *Gripper) OpenCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return len(g.Opens)
+}
+
+// PoseTracker reports configured bodies; a body not set is "not tracked".
+type PoseTracker struct {
+	posetracker.PoseTracker
+
+	mu    sync.Mutex
+	frame string
+	poses map[string]spatialmath.Pose
+	err   error
+	reads int
+}
+
+// NewPoseTracker returns a tracker whose poses are reported in frame.
+func NewPoseTracker(frame string) *PoseTracker {
+	return &PoseTracker{frame: frame, poses: map[string]spatialmath.Pose{}}
+}
+
+func (p *PoseTracker) Name() resource.Name { return posetracker.Named("tracker") }
+
+// SetPose sets (and tracks) a body.
+func (p *PoseTracker) SetPose(body string, pose spatialmath.Pose) {
+	p.mu.Lock()
+	p.poses[body] = pose
+	p.mu.Unlock()
+}
+
+// Lose drops a body from the map, as the vive tracker does when a controller's data freezes.
+func (p *PoseTracker) Lose(body string) {
+	p.mu.Lock()
+	delete(p.poses, body)
+	p.mu.Unlock()
+}
+
+// SetErr makes every read fail with err (nil restores).
+func (p *PoseTracker) SetErr(err error) {
+	p.mu.Lock()
+	p.err = err
+	p.mu.Unlock()
+}
+
+func (p *PoseTracker) Poses(_ context.Context, bodies []string, _ map[string]interface{}) (referenceframe.FrameSystemPoses, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reads++
+	if p.err != nil {
+		return nil, p.err
+	}
+	out := referenceframe.FrameSystemPoses{}
+	for _, b := range bodies {
+		if pose, ok := p.poses[b]; ok {
+			out[b] = referenceframe.NewPoseInFrame(p.frame, pose)
+		}
+	}
+	return out, nil
+}
+
+// ReadCount is how many times Poses was called.
+func (p *PoseTracker) ReadCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.reads
+}
+
+// Frames answers TransformPose for a zero pose in a known frame with that frame's rotation
+// into world; an unknown frame is an error, as the frame system reports it.
+type Frames struct {
+	mu        sync.Mutex
+	Rotations map[string]spatialmath.Orientation
+	Calls     int
+}
+
+func NewFrames(rotations map[string]spatialmath.Orientation) *Frames {
+	return &Frames{Rotations: rotations}
+}
+
+func (f *Frames) TransformPose(_ context.Context, pif *referenceframe.PoseInFrame, dst string,
+	_ []*referenceframe.LinkInFrame,
+) (*referenceframe.PoseInFrame, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls++
+	rot, ok := f.Rotations[pif.Parent()]
+	if !ok {
+		return nil, fmt.Errorf("frame %q not found in frame system", pif.Parent())
+	}
+	return referenceframe.NewPoseInFrame(dst, spatialmath.Compose(spatialmath.NewPoseFromOrientation(rot), pif.Pose())), nil
+}
+
+// CallCount is how many transforms were asked for.
+func (f *Frames) CallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Calls
+}
+
+// Commander records DoCommands (a capture-control sensor).
+type Commander struct {
+	sensor.Sensor
+
+	mu       sync.Mutex
+	Commands []map[string]interface{}
+	Err      error
+}
+
+func NewCommander() *Commander { return &Commander{} }
+
+func (c *Commander) Name() resource.Name { return sensor.Named("capture") }
+
+func (c *Commander) DoCommand(_ context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Err != nil {
+		return nil, c.Err
+	}
+	c.Commands = append(c.Commands, cmd)
+	return map[string]interface{}{}, nil
+}
+
+// Keys returns the first key of every recorded command, in order.
+func (c *Commander) Keys() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]string, 0, len(c.Commands))
+	for _, cmd := range c.Commands {
+		for k := range cmd {
+			out = append(out, k)
+		}
+	}
+	return out
 }

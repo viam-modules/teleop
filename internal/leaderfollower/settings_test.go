@@ -19,6 +19,8 @@ func TestResolveAppliesDefaults(t *testing.T) {
 	test.That(t, cfg.Filter.DeadzonePosMM, test.ShouldEqual, 1)
 	test.That(t, cfg.Filter.OutlierPosMMPerSec, test.ShouldEqual, 4500)
 	test.That(t, cfg.Hold.Mode, test.ShouldEqual, HoldNone)
+	test.That(t, cfg.MaxSpeedMMPerSec, test.ShouldEqual, 250)
+	test.That(t, cfg.MaxRotDegPerSec, test.ShouldEqual, 180)
 	test.That(t, cfg.Gripper.Mode, test.ShouldEqual, gripper.ModeOpenClose)
 	test.That(t, cfg.Gripper.DeadbandPct, test.ShouldEqual, 3)
 	test.That(t, cfg.MoveTimeout, test.ShouldEqual, 500*time.Millisecond)

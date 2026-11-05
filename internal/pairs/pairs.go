@@ -80,3 +80,36 @@ func Resolve[T any](defaults T, overrides []map[string]interface{}, validate fun
 	}
 	return out, nil
 }
+
+// Scope returns the pair a DoCommand is scoped to: "pair", or "side" as an alias. Any key
+// other than "command", "pair", "side" and the allowed extras is an error, so a typo does not
+// silently act on every pair.
+func Scope(cmd map[string]interface{}, allowed ...string) (string, error) {
+	pair, hasPair := cmd["pair"].(string)
+	side, hasSide := cmd["side"].(string)
+	switch {
+	case hasPair && hasSide && pair != side:
+		return "", fmt.Errorf("pair %q and side %q disagree; use pair", pair, side)
+	case hasPair:
+		return pair, nil
+	case hasSide:
+		return side, nil
+	}
+	for k := range cmd {
+		switch k {
+		case "command", "pair", "side":
+			continue
+		}
+		ok := false
+		for _, a := range allowed {
+			if k == a {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return "", fmt.Errorf("unknown key %q; commands take \"command\" and optionally \"pair\"", k)
+		}
+	}
+	return "", nil
+}

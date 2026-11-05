@@ -15,6 +15,7 @@ import (
 
 	"teleop/internal/filter"
 	"teleop/internal/gripper"
+	"teleop/internal/hold"
 	"teleop/internal/pipeline"
 	"teleop/internal/posemath"
 )
@@ -98,6 +99,11 @@ const (
 	StopReasonSessionLost StopReason = "session_lost"
 	// StopReasonMaxErrors: MaxConsecutiveErrors ticks failed in a row.
 	StopReasonMaxErrors StopReason = "max_errors"
+	// StopReasonPipelineError: the motion service's teleop pipeline reported an error (a
+	// planner failure, or an arm fault such as an emergency stop). The follower is removed
+	// from the pipeline at once, so a fault the arm driver clears by itself cannot resume
+	// motion toward a stale target.
+	StopReasonPipelineError StopReason = "pipeline_error"
 )
 
 // Status is a snapshot for DoCommand/CLI reporting.
@@ -109,7 +115,8 @@ type Status struct {
 	LastHoldError     string     `json:"last_hold_error"`
 	Cycles            uint64     `json:"cycles"` // ticks completed without error
 	Sends             uint64     `json:"sends"`
-	Dropped           uint64     `json:"dropped"` // a send was due but one was already in flight
+	Dropped           uint64     `json:"dropped"`       // a send was due but one was already in flight
+	SpeedLimited      uint64     `json:"speed_limited"` // ticks where a speed cap held the follower back
 	Deadzoned         uint64     `json:"deadzoned"`
 	Rejected          uint64     `json:"rejected"` // outlier rejections
 	TickOverruns      uint64     `json:"tick_overruns"`
@@ -136,9 +143,16 @@ type Engine struct {
 	deps Deps
 	cfg  Config
 
-	sender *pipeline.Sender
-	out    *gripper.Output
-	reader *gripper.Reader // nil without a leader gripper
+	sender  *pipeline.Sender
+	limiter *filter.Limiter
+	out     *gripper.Output
+	reader  *gripper.Reader // nil without a leader gripper
+	holder  *hold.Holder
+
+	// goal is the latest filtered target; the limiter walks toward it every tick. Touched only
+	// by Start (before the loop) and the loop.
+	goal          spatialmath.Pose
+	pipelineFault atomic.Pointer[string] // set by pollStatus, acted on by tick
 
 	mu      sync.Mutex
 	running bool // the mirror loop is alive
@@ -156,13 +170,12 @@ type Engine struct {
 
 	cycles, tickOverruns, errorsTotal uint64
 	consecutiveErrors                 int
-	lastError, lastHoldError          string
+	lastError                         string
 	lastErrorAt                       time.Time
 	stoppedReason                     StopReason
 	pipelineError                     string
 	pipelinePlanMs                    float64
 
-	leaderHeld       atomic.Bool
 	leaderReadNanos  atomic.Int64
 	gripperReadNanos atomic.Int64
 	poseLogAt        atomic.Int64 // poselog.go
@@ -196,6 +209,19 @@ func New(deps Deps, cfg Config) (*Engine, error) {
 	}
 	e := &Engine{deps: deps, cfg: cfg}
 	e.sender = pipeline.NewSender(deps.Pipeline, cfg.MoveTimeout)
+	if cfg.MaxSpeedMMPerSec <= 0 {
+		cfg.MaxSpeedMMPerSec = filter.DefaultMaxSpeedMMPerSec
+	}
+	if cfg.MaxRotDegPerSec <= 0 {
+		cfg.MaxRotDegPerSec = filter.DefaultMaxRotDegPerSec
+	}
+	e.cfg = cfg
+	e.limiter = filter.NewLimiter(cfg.MaxSpeedMMPerSec, cfg.MaxRotDegPerSec)
+	var leaderGripper hold.Commander
+	if deps.LeaderGripper != nil {
+		leaderGripper = deps.LeaderGripper
+	}
+	e.holder = hold.New(deps.Leader, leaderGripper, cfg.Hold, deps.Logger)
 	e.out = gripper.NewOutput(deps.FollowerGripper, cfg.Gripper)
 	if deps.LeaderGripper != nil && e.out.Enabled() {
 		r, err := gripper.NewReader(deps.LeaderGripper, cfg.GripperRead.Command, cfg.GripperRead.Key)
@@ -242,6 +268,14 @@ func (e *Engine) Start(ctx context.Context) error {
 			return err
 		}
 	}
+	// A pipeline that is already failing (another pair's arm faulted, a planner error) is
+	// not one to add a follower to.
+	if st, err := e.deps.Pipeline.Status(ctx); err == nil {
+		if perr, _ := st["error"].(string); perr != "" {
+			e.releaseLeader(ctx)
+			return fmt.Errorf("the teleop pipeline reports an error; not starting: %s", perr)
+		}
+	}
 	if err := e.deps.Pipeline.Start(ctx, al.FollowerPose); err != nil {
 		e.releaseLeader(ctx)
 		return err
@@ -251,6 +285,9 @@ func (e *Engine) Start(ctx context.Context) error {
 	e.sessionOpen = true
 	e.startOri = al.FollowerPose.Orientation()
 	e.filter = filter.New(e.cfg.Filter)
+	e.goal = al.FollowerPose
+	e.limiter.Reset(al.FollowerPose, e.deps.Now())
+	e.pipelineFault.Store(nil)
 	e.sender.Reset()
 	e.out.Reset()
 	e.cycles, e.tickOverruns, e.errorsTotal = 0, 0, 0
@@ -467,11 +504,12 @@ func (e *Engine) Status() Status {
 		Running:           e.running,
 		SessionID:         e.sessionID,
 		StoppedReason:     e.stoppedReason,
-		LeaderHeld:        e.leaderHeld.Load(),
-		LastHoldError:     e.lastHoldError,
+		LeaderHeld:        e.holder.Held(),
+		LastHoldError:     e.holder.LastError(),
 		Cycles:            e.cycles,
 		Sends:             snd.Sends,
 		Dropped:           snd.Dropped,
+		SpeedLimited:      e.limiter.Limited(),
 		TickOverruns:      e.tickOverruns,
 		ConsecutiveErrors: e.consecutiveErrors,
 		ErrorsTotal:       e.errorsTotal,
@@ -545,6 +583,9 @@ func (e *Engine) pollStatus(ctx context.Context) {
 			e.mu.Lock()
 			prev := e.pipelineError
 			e.pipelineError, e.pipelinePlanMs = perr, plan
+			if perr != "" {
+				e.pipelineFault.Store(&perr)
+			}
 			e.mu.Unlock()
 			if perr != prev {
 				if perr != "" {
@@ -562,6 +603,25 @@ func (e *Engine) pollStatus(ctx context.Context) {
 // them. A gripper write failure is logged but does not count toward stopping the loop: the
 // arm keeps mirroring without its gripper.
 func (e *Engine) tick(ctx context.Context) bool {
+	if fault := e.pipelineFault.Load(); fault != nil {
+		e.sender.Wait()
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		e.errorsTotal++
+		e.lastError = "teleop pipeline error: " + *fault
+		e.lastErrorAt = e.deps.Now()
+		e.stoppedReason = StopReasonPipelineError
+		e.running = false
+		e.deps.Logger.Errorf("leader-follower loop stopping (%s): %s; removing the follower from the pipeline", e.stoppedReason, *fault)
+		// Unregister now rather than at Stop: an arm whose driver clears faults by itself
+		// would otherwise resume toward the last target. The leader stays held until Stop.
+		stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if perr := e.deps.Pipeline.Stop(stopCtx); perr != nil && !pipeline.IsSessionLost(perr) {
+			e.deps.Logger.Warnf("teleop_stop after pipeline error: %v", perr)
+		}
+		return true
+	}
 	var err error
 	if !e.sender.Lost() {
 		err = e.syncOnce(ctx)
@@ -617,8 +677,14 @@ func (e *Engine) syncOnce(ctx context.Context) error {
 	e.mu.Lock()
 	f := e.filter
 	e.mu.Unlock()
-	if send, ok := f.Step(e.deps.Now(), target); ok {
-		e.sender.TrySend(send)
+	now := e.deps.Now()
+	if filtered, ok := f.Step(now, target); ok {
+		e.goal = filtered
+	}
+	// The limiter steps every tick toward the latest goal, so a follower that fell behind a
+	// fast leader keeps catching up at the capped speed after the leader stops.
+	if cmd, send := e.limiter.Step(now, e.goal); send {
+		e.sender.TrySend(cmd)
 	}
 	return e.mirrorGripper(ctx)
 }
