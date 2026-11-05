@@ -3,7 +3,7 @@
   "module_id": "viam:teleop",
   "visibility": "public",
   "url": "https://github.com/viam-modules/teleop",
-  "description": "Arm teleoperation services: leader-follower (a leader arm's end-effector pose mirrored onto any arm through the motion service teleop pipeline)",
+  "description": "Arm teleoperation services: clutch (drag the follower while a pedal or grip is held, from a pose tracker or a leader arm) and leader-follower (a leader arm's end-effector pose mirrored onto any arm through the motion service teleop pipeline)",
   "markdown_link": "README.md",
   "entrypoint": "bin/teleop",
   "first_run": "",
@@ -21,9 +21,15 @@
   "models": [
     {
       "api": "rdk:service:generic",
+      "model": "viam:teleop:clutch",
+      "short_description": "Drive a follower arm from a pose tracker body or a leader arm only while a clutch control (grip, foot pedal) is held",
+      "markdown_link": "README.md#model-viamteleopclutch"
+    },
+    {
+      "api": "rdk:service:generic",
       "model": "viam:teleop:leader-follower",
       "short_description": "Mirror a leader arm's end-effector pose onto any follower arm through the motion teleop pipeline",
-      "markdown_link": "docs/leader-follower.md"
+      "markdown_link": "README.md#model-viamteleopleader-follower"
     }
   ]
 }

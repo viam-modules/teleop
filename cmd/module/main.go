@@ -6,9 +6,13 @@ import (
 	"go.viam.com/rdk/resource"
 	"go.viam.com/rdk/services/generic"
 
+	"teleop/services/clutch"
 	"teleop/services/leaderfollower"
 )
 
 func main() {
-	module.ModularMain(resource.APIModel{API: generic.API, Model: leaderfollower.Model})
+	module.ModularMain(
+		resource.APIModel{API: generic.API, Model: clutch.Model},
+		resource.APIModel{API: generic.API, Model: leaderfollower.Model},
+	)
 }

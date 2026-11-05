@@ -1,0 +1,10 @@
+{
+  "pose_tracker": "vive",
+  "rotation_mode": "absolute",
+  "tool_orientation": { "type": "euler_angles", "value": { "roll": 90, "pitch": 0, "yaw": 70 } },
+  "capture_control_sensor": "capture-ctrl",
+  "pairs": [
+    { "name": "left",  "body": "left",  "follower_component": "right-gripper" },
+    { "name": "right", "body": "right", "follower_component": "left-gripper" }
+  ]
+}

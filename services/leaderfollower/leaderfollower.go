@@ -206,34 +206,11 @@ func (s *service) pairNames() []string {
 	return out
 }
 
-// scope returns the pair a command is scoped to: "pair", or "side" as an alias. Any other
-// key that looks like scoping is an error, so a typo does not silently act on every pair.
-func scope(cmd map[string]interface{}) (string, error) {
-	pair, hasPair := cmd["pair"].(string)
-	side, hasSide := cmd["side"].(string)
-	switch {
-	case hasPair && hasSide && pair != side:
-		return "", fmt.Errorf("pair %q and side %q disagree; use pair", pair, side)
-	case hasPair:
-		return pair, nil
-	case hasSide:
-		return side, nil
-	}
-	for k := range cmd {
-		switch k {
-		case "command", "pair", "side":
-		default:
-			return "", fmt.Errorf("unknown key %q; commands take \"command\" and optionally \"pair\"", k)
-		}
-	}
-	return "", nil
-}
-
 // DoCommand accepts start, stop and status, each optionally scoped with "pair": "<name>".
 // start reports a failing pair as an error but still starts the others; status then shows
 // which ones are running.
 func (s *service) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	pair, err := scope(cmd)
+	pair, err := pairs.Scope(cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -275,6 +252,7 @@ func (s *service) statusMap(pair string) (map[string]interface{}, error) {
 			"cycles":                      st.Cycles,
 			"sends":                       st.Sends,
 			"dropped":                     st.Dropped,
+			"speed_limited":               st.SpeedLimited,
 			"deadzoned":                   st.Deadzoned,
 			"rejected":                    st.Rejected,
 			"tick_overruns":               st.TickOverruns,

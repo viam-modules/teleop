@@ -9,42 +9,8 @@ import (
 
 	"teleop/internal/filter"
 	"teleop/internal/gripper"
+	"teleop/internal/hold"
 )
-
-// Hold is how the leader arm is presented to the operator's hand once a session starts.
-type Hold string
-
-const (
-	// HoldNone sends the leader nothing. The default: the arm stays however it was.
-	HoldNone Hold = "none"
-	// HoldManual uses the arm API's manual mode (arm.SetManualMode): exit it before capture
-	// or align, enter it afterwards, exit it on stop. Refused on an arm whose Properties do not
-	// report SupportManualMode.
-	HoldManual Hold = "manual"
-	// HoldCustom sends the configured DoCommand lists at the same three points, for a leader
-	// whose module has no manual-mode API. No command name is defaulted.
-	HoldCustom Hold = "custom"
-)
-
-// LeaderCommands are ordered DoCommand payloads sent to the leader arm under HoldCustom.
-type LeaderCommands struct {
-	// BeforeStart runs before capture or align; a failure is logged at debug level and
-	// ignored (its job is to undo a hold a crashed session left behind).
-	BeforeStart []map[string]interface{} `json:"before_start,omitempty"`
-	// AfterStart runs once the leader is at its session pose; a failure aborts Start and
-	// sends OnStop.
-	AfterStart []map[string]interface{} `json:"after_start,omitempty"`
-	// OnStop runs on stop; a failure is warned, not returned.
-	OnStop []map[string]interface{} `json:"on_stop,omitempty"`
-}
-
-// GripperCommands are ordered DoCommand payloads sent to the leader gripper at start (after
-// the leader is at its session pose) and at stop, under any hold mode. The usual use is to
-// free a trigger servo so it can be squeezed. Failures are warned, not returned.
-type GripperCommands struct {
-	OnStart []map[string]interface{} `json:"on_start,omitempty"`
-	OnStop  []map[string]interface{} `json:"on_stop,omitempty"`
-}
 
 // Vec3 is a JSON-friendly millimetre vector.
 type Vec3 struct {
@@ -78,6 +44,11 @@ type Settings struct {
 	SmoothTauMs    *float64 `json:"smooth_tau_ms,omitempty"`    // default 100; 0 disables
 	PosDeadzoneMM  float64  `json:"pos_deadzone_mm,omitempty"`  // default 1
 	RotDeadzoneDeg float64  `json:"rot_deadzone_deg,omitempty"` // default 1
+
+	// Follower speed caps: how fast the commanded follower pose may move, whatever the
+	// leader does and whatever the scale. Always on.
+	MaxSpeedMMPerSec float64 `json:"max_speed_mm_per_s,omitempty"`     // default 250
+	MaxRotDegPerSec  float64 `json:"max_rotation_deg_per_s,omitempty"` // default 180
 
 	// Alignment.
 	AlignOnStart            bool    `json:"align_on_start,omitempty"`              // default false: capture where both arms are, move nothing
@@ -182,13 +153,11 @@ func (s Settings) Validate() error {
 	if s.SmoothTauMs != nil && *s.SmoothTauMs < 0 {
 		return fmt.Errorf("smooth_tau_ms must not be negative")
 	}
-	switch s.LeaderHold {
-	case "", HoldNone, HoldManual, HoldCustom:
-	case "stiff", "torque_off":
-		return fmt.Errorf("leader_hold %q is no longer supported; use %q, %q or %q with leader_commands",
-			s.LeaderHold, HoldNone, HoldManual, HoldCustom)
-	default:
-		return fmt.Errorf("leader_hold must be %q, %q or %q, got %q", HoldNone, HoldManual, HoldCustom, s.LeaderHold)
+	if s.MaxSpeedMMPerSec < 0 || s.MaxRotDegPerSec < 0 {
+		return fmt.Errorf("max_speed_mm_per_s and max_rotation_deg_per_s must be positive; the caps cannot be turned off")
+	}
+	if err := hold.ValidateMode(s.LeaderHold); err != nil {
+		return err
 	}
 	if s.ManualMode != nil && s.LeaderHold != HoldManual {
 		return fmt.Errorf("manual_mode needs leader_hold %q", HoldManual)
@@ -196,19 +165,14 @@ func (s Settings) Validate() error {
 	if s.LeaderCommands != nil && s.LeaderHold != HoldCustom {
 		return fmt.Errorf("leader_commands needs leader_hold %q", HoldCustom)
 	}
-	if err := validateCommandLists("leader_commands", s.LeaderCommands); err != nil {
+	if err := hold.ValidateLeaderCommands("leader_commands", s.LeaderCommands); err != nil {
 		return err
 	}
-	if s.LeaderGripperCommands != nil {
-		if s.LeaderGripper == "" {
-			return fmt.Errorf("leader_gripper_commands needs leader_gripper")
-		}
-		if err := validateCommandList("leader_gripper_commands.on_start", s.LeaderGripperCommands.OnStart); err != nil {
-			return err
-		}
-		if err := validateCommandList("leader_gripper_commands.on_stop", s.LeaderGripperCommands.OnStop); err != nil {
-			return err
-		}
+	if s.LeaderGripperCommands != nil && s.LeaderGripper == "" {
+		return fmt.Errorf("leader_gripper_commands needs leader_gripper")
+	}
+	if err := hold.ValidateGripperCommands("leader_gripper_commands", s.LeaderGripperCommands); err != nil {
+		return err
 	}
 	mode, _ := gripper.NormalizeMode(s.FollowerGripperMode)
 	switch mode {
@@ -250,42 +214,12 @@ func (s Settings) Validate() error {
 	return nil
 }
 
-func validateCommandLists(prefix string, c *LeaderCommands) error {
-	if c == nil {
-		return nil
-	}
-	if err := validateCommandList(prefix+".before_start", c.BeforeStart); err != nil {
-		return err
-	}
-	if err := validateCommandList(prefix+".after_start", c.AfterStart); err != nil {
-		return err
-	}
-	return validateCommandList(prefix+".on_stop", c.OnStop)
-}
-
-func validateCommandList(path string, l []map[string]interface{}) error {
-	for i, c := range l {
-		if len(c) == 0 {
-			return fmt.Errorf("%s[%d]: a DoCommand payload must be a non-empty object", path, i)
-		}
-	}
-	return nil
-}
-
 // MotionName returns the motion service name, defaulted.
 func (s Settings) MotionName() string {
 	if s.MotionService == "" {
 		return "builtin"
 	}
 	return s.MotionService
-}
-
-// HoldConfig is the resolved leader-hold configuration.
-type HoldConfig struct {
-	Mode        Hold
-	ManualExtra map[string]interface{}
-	Leader      LeaderCommands
-	Gripper     GripperCommands
 }
 
 // GripperReadConfig is how the leader gripper's percentage is read.
@@ -300,7 +234,10 @@ type Config struct {
 	RateHz          float64
 	RotationEnabled bool
 	Filter          filter.Config
-	IK              IKOptions
+
+	MaxSpeedMMPerSec float64
+	MaxRotDegPerSec  float64
+	IK               IKOptions
 
 	// AlignOnStart drives the leader to the follower's pose before mirroring (IK + a blocking
 	// move). Off by default: the default start captures both arms where they are and mirrors
@@ -347,9 +284,11 @@ func (s Settings) Resolve() (Config, error) {
 	}
 
 	cfg := Config{
-		Mapping:         m,
-		RateHz:          pick(s.RateHz, DefaultRateHz),
-		RotationEnabled: s.RotationEnabled == nil || *s.RotationEnabled,
+		Mapping:          m,
+		RateHz:           pick(s.RateHz, DefaultRateHz),
+		MaxSpeedMMPerSec: pick(s.MaxSpeedMMPerSec, filter.DefaultMaxSpeedMMPerSec),
+		MaxRotDegPerSec:  pick(s.MaxRotDegPerSec, filter.DefaultMaxRotDegPerSec),
+		RotationEnabled:  s.RotationEnabled == nil || *s.RotationEnabled,
 		Filter: filter.Config{
 			SmoothTau:           DefaultSmoothTau,
 			OutlierPosMMPerSec:  OutlierPosMMPerSec,

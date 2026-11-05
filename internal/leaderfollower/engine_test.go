@@ -12,6 +12,7 @@ import (
 	"go.viam.com/rdk/spatialmath"
 	"go.viam.com/test"
 
+	"teleop/internal/filter"
 	"teleop/internal/gripper"
 	"teleop/internal/pipeline"
 	"teleop/internal/posemath"
@@ -78,6 +79,9 @@ func newRig(t *testing.T, followerJoints []referenceframe.Input, opts ...rigOpti
 		Hold:                 HoldConfig{Mode: HoldManual},
 		MoveTimeout:          time.Second,
 		MaxConsecutiveErrors: 10,
+		// Caps far out of the way: these tests are about the mapping. The caps have their own.
+		MaxSpeedMMPerSec: 1e9,
+		MaxRotDegPerSec:  1e9,
 	}
 	for _, o := range opts {
 		o(&cfg, r)
@@ -170,11 +174,11 @@ func TestCaptureStartMovesNothingAndMirrorsDeltas(t *testing.T) {
 	before, _ := r.leader.Model().Transform(jHome)
 	after, _ := r.leader.Model().Transform(jA)
 	r.leader.SetJoints(jA)
-	n := r.motion.MoveCount()
-	r.waitForMoves(t, n+2)
 	wantDelta := r.mapping.Forward(after).Point().Sub(r.mapping.Forward(before).Point())
-	got := r.motion.LastMove().Point().Sub(far.Point())
-	test.That(t, got.Sub(wantDelta).Norm(), test.ShouldBeLessThan, 1e-3)
+	waitFor(t, "the mirrored delta", func() bool {
+		m := r.motion.LastMove()
+		return m != nil && m.Point().Sub(far.Point()).Sub(wantDelta).Norm() < 1e-3
+	})
 }
 
 func TestAlignRefusesWhenTheFollowerIsTooFarAwayAndTouchesNothing(t *testing.T) {
@@ -300,14 +304,23 @@ func TestHoldCustomSendsTheConfiguredListsInOrderAndAbortsOnAnAfterStartFailure(
 
 func TestOnlyOneMoveIsInFlightAndTheRestAreDropped(t *testing.T) {
 	r := newRig(t, jA)
+	// A slow cap keeps the follower catching up, so every tick has a new target to offer.
+	r.engine.limiter = filter.NewLimiter(1, 1e9)
 	r.motion.MoveWait = make(chan struct{})
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			close(r.motion.MoveWait) // never leave the cleanup Stop waiting on a blocked move
+		}
+	})
 	test.That(t, r.engine.Start(context.Background()), test.ShouldBeNil)
-	r.leader.SetJoints(jB) // every tick now has a new target
+	r.leader.SetJoints(jB)
 	waitFor(t, "drops", func() bool { return r.engine.Status().Dropped >= 5 })
 	st := r.engine.Status()
 	test.That(t, st.Sends, test.ShouldEqual, 1)
 	test.That(t, st.Running, test.ShouldBeTrue)
 	close(r.motion.MoveWait)
+	released = true
 	waitFor(t, "more sends", func() bool { return r.engine.Status().Sends >= 2 })
 }
 
@@ -349,8 +362,7 @@ func TestRotationDisabledHoldsTheFollowersStartOrientation(t *testing.T) {
 	rolled := append([]referenceframe.Input(nil), jA...)
 	rolled[4] += 1.2 // wrist roll: a pure orientation change at the leader
 	r.leader.SetJoints(rolled)
-	n := r.motion.MoveCount()
-	r.waitForMoves(t, n+2)
+	time.Sleep(50 * time.Millisecond) // many ticks at 200 Hz
 	last := r.motion.LastMove()
 	test.That(t, posemath.AngleBetweenDeg(last, r.follower), test.ShouldBeLessThan, 1e-6)
 
@@ -358,9 +370,10 @@ func TestRotationDisabledHoldsTheFollowersStartOrientation(t *testing.T) {
 	r2 := newRig(t, jA)
 	test.That(t, r2.engine.Start(context.Background()), test.ShouldBeNil)
 	r2.leader.SetJoints(rolled)
-	n = r2.motion.MoveCount()
-	r2.waitForMoves(t, n+2)
-	test.That(t, posemath.AngleBetweenDeg(r2.motion.LastMove(), r2.follower), test.ShouldBeGreaterThan, 30)
+	waitFor(t, "the roll", func() bool {
+		m := r2.motion.LastMove()
+		return m != nil && posemath.AngleBetweenDeg(m, r2.follower) > 30
+	})
 }
 
 func TestGripperMirrorsOnChangeOnlyThroughTheConfiguredCommands(t *testing.T) {
@@ -420,15 +433,57 @@ func TestAFailingFollowerGripperWriteDoesNotStopTheLoop(t *testing.T) {
 	test.That(t, r.engine.Status().ConsecutiveErrors, test.ShouldEqual, 0)
 }
 
-func TestThePipelinesOwnErrorSurfacesInStatus(t *testing.T) {
+// TestAPipelineErrorStopsTheLoopAndUnregistersTheFollower: the sends keep succeeding when
+// the pipeline fails (teleop_move only stores a pose), so the status poll must stop the loop,
+// and the follower must leave the pipeline at once so an arm whose driver clears its own
+// faults cannot resume toward the last target.
+func TestAPipelineErrorStopsTheLoopAndUnregistersTheFollower(t *testing.T) {
 	r := newRig(t, jA)
-	test.That(t, r.engine.Start(context.Background()), test.ShouldBeNil)
-	r.motion.SetStatusError("collision with table")
-	waitFor(t, "pipeline error", func() bool { return r.engine.Status().PipelineError == "collision with table" })
-	test.That(t, r.engine.Status().PipelinePlanMs, test.ShouldEqual, 12)
-	test.That(t, r.engine.Status().Running, test.ShouldBeTrue) // sends still succeed
+	ctx := context.Background()
+	test.That(t, r.engine.Start(ctx), test.ShouldBeNil)
+	r.motion.SetStatusError("xArm: Emergency Stop Button Pushed In")
+	waitFor(t, "loop stop", func() bool { return !r.engine.Status().Running })
+	st := r.engine.Status()
+	test.That(t, st.StoppedReason, test.ShouldEqual, StopReasonPipelineError)
+	test.That(t, st.PipelineError, test.ShouldEqual, "xArm: Emergency Stop Button Pushed In")
+	test.That(t, st.LastError, test.ShouldContainSubstring, "Emergency Stop")
+	test.That(t, r.motion.StopCount(), test.ShouldEqual, 1) // unregistered without waiting for Stop
+	test.That(t, st.LeaderHeld, test.ShouldBeTrue)          // the hand may be on it
+
+	// While the pipeline still reports it, start is refused and the leader is let go.
+	test.That(t, r.engine.Stop(ctx), test.ShouldBeNil)
+	err := r.engine.Start(ctx)
+	test.That(t, err, test.ShouldNotBeNil)
+	test.That(t, err.Error(), test.ShouldContainSubstring, "Emergency Stop")
+	test.That(t, r.motion.StartCount(), test.ShouldEqual, 1)
+	test.That(t, r.leader.InManualMode(), test.ShouldBeFalse)
+
 	r.motion.SetStatusError("")
-	waitFor(t, "pipeline error cleared", func() bool { return r.engine.Status().PipelineError == "" })
+	test.That(t, r.engine.Start(ctx), test.ShouldBeNil)
+	time.Sleep(50 * time.Millisecond)
+	test.That(t, r.engine.Status().Running, test.ShouldBeTrue)
+}
+
+func TestAFastLeaderIsFollowedAtTheCappedSpeed(t *testing.T) {
+	r := newRig(t, jA, withCapture())
+	r.engine.cfg.MaxSpeedMMPerSec, r.engine.cfg.MaxRotDegPerSec = 250, 180
+	r.engine.limiter = filter.NewLimiter(250, 180)
+	test.That(t, r.engine.Start(context.Background()), test.ShouldBeNil)
+	r.waitForMoves(t, 1)
+	r.leader.SetJoints(jB)                         // one tick: a jump of hundreds of mm at scale 2
+	before, _ := r.leader.Model().Transform(jHome) // the rig's leader starts at home
+	after, _ := r.leader.Model().Transform(jB)
+	wantPt := r.follower.Point().Add(r.mapping.Forward(after).Point().Sub(r.mapping.Forward(before).Point()))
+	waitFor(t, "arrival", func() bool {
+		m := r.motion.LastMove()
+		return m != nil && m.Point().Sub(wantPt).Norm() < 1e-3
+	})
+	moves := r.motion.MovePoses()
+	for i := 1; i < len(moves); i++ {
+		test.That(t, moves[i].Point().Sub(moves[i-1].Point()).Norm(), test.ShouldBeLessThanOrEqualTo, 250*0.1+1e-6)
+	}
+	test.That(t, len(moves), test.ShouldBeGreaterThan, 5)
+	test.That(t, r.engine.Status().SpeedLimited, test.ShouldBeGreaterThan, 0)
 }
 
 func TestStartIsIdempotentAndStopWithoutStartIsANoOp(t *testing.T) {
