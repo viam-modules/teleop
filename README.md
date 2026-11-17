@@ -113,6 +113,23 @@ More in [`examples/clutch-pedal-so101.json`](examples/clutch-pedal-so101.json) a
 | `capture_control_sensor`      | string      | No                | Sensor sent `{"start-capture": true}` on `start` and `{"stop-capture": true}` on `stop`.                                                          |
 | `pairs`                       | object[]    | No                | Pairs, each a `name` plus any keys above.                                                                                                         |
 
+Fixed obstacles. At each `start` the service reads the frame system once: the geometry of `follower_component` is the tool, and the geometry of every frame with no joints above it (a table, a wall) is an obstacle. With both present, the follower is kept out of those obstacles; with either missing, nothing changes. There is nothing to configure.
+
+- Every tick the service measures the tool, at the hand's target, against the nearest obstacle with rdk's distance function, and works out the surface: the plane the target must stay on one side of, 5 mm outside the obstacle.
+- The follower's commanded pose is moved back onto that plane, so the follower slides along the obstacle and the motion planner has nothing to refuse. Turning the tool on the surface moves the plane to match, so a corner does not swing into the obstacle.
+- For a pose tracker pair, the plane is converted into the tracker's frame and sent to the tracker as a `constraint` DoCommand, renewed every tick. A tracker that can push back (`viam:haply:pose-tracker`) holds the hand there. A tracker that does not know the command refuses it; after five refusals in a row it is not sent any more that session.
+
+```json
+{ "command": "constraint", "type": "plane",
+  "point_mm": { "x": 0, "y": 0, "z": -32 }, "normal": { "x": 0, "y": 0, "z": 1 },
+  "stiffness_n_per_m": 400, "max_force_n": 2.5, "hold_ms": 300 }
+```
+
+`{"command": "clear_constraint"}` is sent when the session ends.
+
+Limits: one surface at a time, the nearest. Only the tool is checked, and only against obstacles that never move; the planner still checks the rest of the arm, and a refusal from it ends the session as before. A surface the hand has crossed stays in force until the hand comes back across it. A session that starts with the tool already inside an obstacle's margin has no surface until the tool leaves it.
+
+
 Fixed: outlier rejection at 4500 mm/s and 2700 deg/s (accepted after 5 in a row), a 500 ms send timeout, a 3 % gripper deadband.
 
 ### DoCommand
@@ -182,6 +199,7 @@ Returns:
 | `rate_hz` / `rotation_mode`                                            | The configured rate and the current rotation mode.                                        |
 | `gripper_pct` / `gripper_writes`                                       | The last percentage accepted and how many follower writes were issued.                    |
 | `pipeline_error` / `pipeline_plan_ms`                                  | Copied from the motion service's `teleop_status` every 200 ms.                            |
+| `surface`                                                              | `obstacle` the current surface belongs to, `contact` (the hand is past it), `held` (ticks the follower was held on a surface), `device` (the tracker is taking the surface), `device_error`. |
 
 ---
 
