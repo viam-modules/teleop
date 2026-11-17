@@ -2,6 +2,7 @@ package clutch
 
 import (
 	"context"
+	"errors"
 	"math"
 	"sync"
 	"testing"
@@ -29,16 +30,12 @@ func tableWorld(t *testing.T) *surface.World {
 	}
 }
 
-func hapticCfg() HapticsConfig {
-	return HapticsConfig{Enabled: true, MarginMM: 5, RangeMM: 80, StiffnessNPerM: 400, MaxForceN: 2.5}
-}
-
 func at(x, y, z float64) spatialmath.Pose {
 	return spatialmath.NewPose(r3.Vector{X: x, Y: y, Z: z}, ov(0, 0, -1, 0))
 }
 
 func TestGuardHoldsTheSurfaceMeasuredFromOutside(t *testing.T) {
-	g := newGuard(tableWorld(t), hapticCfg())
+	g := newGuard(tableWorld(t))
 
 	// Far above: nothing in range.
 	test.That(t, g.update(at(500, 100, 500)), test.ShouldBeNil)
@@ -68,7 +65,7 @@ func TestGuardHoldsTheSurfaceMeasuredFromOutside(t *testing.T) {
 	p = g.update(at(500, 100, 150))
 	test.That(t, p.normal.Z, test.ShouldAlmostEqual, 1, 1e-6)
 	test.That(t, g.project(at(500, 100, 150)).Point().Z, test.ShouldAlmostEqual, 265, 1e-6)
-	test.That(t, g.status().Projected, test.ShouldEqual, uint64(2))
+	test.That(t, g.status().Held, test.ShouldEqual, uint64(2))
 
 	// Back out above the margin: free again, and a command above the plane is left alone.
 	p = g.update(at(500, 100, 280))
@@ -82,7 +79,7 @@ func TestGuardHoldsTheSurfaceMeasuredFromOutside(t *testing.T) {
 }
 
 func TestGuardStartingInsideAnObstacleDoesNothing(t *testing.T) {
-	g := newGuard(tableWorld(t), hapticCfg())
+	g := newGuard(tableWorld(t))
 	// Never seen from outside: there is no plane to trust, so nothing is enforced.
 	test.That(t, g.update(at(500, 100, 252)), test.ShouldBeNil)
 	test.That(t, g.project(at(500, 100, 252)).Point().Z, test.ShouldEqual, 252)
@@ -139,9 +136,9 @@ func (d *recordingDevice) got() []map[string]interface{} {
 
 func TestHapticSenderKeepsOnlyTheNewestAndClears(t *testing.T) {
 	dev := &recordingDevice{block: make(chan struct{})}
-	s := &hapticSender{dev: dev, g: newGuard(tableWorld(t), hapticCfg())}
+	s := &hapticSender{dev: dev, g: newGuard(tableWorld(t))}
 	cmd := func(z float64) map[string]interface{} {
-		return constraintCommand(r3.Vector{Z: z}, r3.Vector{Z: 1}, hapticCfg())
+		return constraintCommand(r3.Vector{Z: z}, r3.Vector{Z: 1})
 	}
 	// The first goes out and blocks; the next three pile up and only the last survives.
 	s.send(cmd(1))
@@ -171,15 +168,14 @@ func TestTheFollowerSlidesOnASurfaceAndTheDeviceIsToldWhereItIs(t *testing.T) {
 	r := newTrackerRig(t)
 	r.start(t)
 	dev := &recordingDevice{}
-	g := newGuard(tableWorld(t), hapticCfg())
+	g := newGuard(tableWorld(t))
 	r.engine.mu.Lock()
-	r.engine.cfg.Haptics = hapticCfg()
 	r.engine.guard = g
 	r.engine.haptic = &hapticSender{dev: dev, g: g}
 	r.engine.mu.Unlock()
 
 	// A few ticks at the start pose, 40 mm clear of the table, measure the surface.
-	waitFor(t, "the surface", func() bool { return r.engine.Status().Haptics.Obstacle == "table" })
+	waitFor(t, "the surface", func() bool { return r.engine.Status().Surface.Obstacle == "table" })
 	waitFor(t, "a constraint at the device", func() bool { return len(dev.got()) > 0 })
 	first := dev.got()[0]
 	// The hand is at z = 3 with the follower at 300; the surface is at follower z = 265, so
@@ -190,7 +186,7 @@ func TestTheFollowerSlidesOnASurfaceAndTheDeviceIsToldWhereItIs(t *testing.T) {
 	// The hand drops 60 mm, through the table: the follower stops on the surface.
 	r.tracker.SetPose(body, spatialmath.NewPose(r3.Vector{X: 1, Y: 2, Z: 3 - 60}, yaw(0)))
 	r.waitForPose(t, at(500, 100, 265))
-	test.That(t, r.engine.Status().Haptics.Contact, test.ShouldBeTrue)
+	test.That(t, r.engine.Status().Surface.Contact, test.ShouldBeTrue)
 
 	// Sliding the hand along the tracker's X moves the follower along world Y, still on
 	// the surface.
@@ -200,8 +196,8 @@ func TestTheFollowerSlidesOnASurfaceAndTheDeviceIsToldWhereItIs(t *testing.T) {
 	// Lifting the hand back frees it.
 	r.tracker.SetPose(body, spatialmath.NewPose(r3.Vector{X: 11, Y: 2, Z: 3}, yaw(0)))
 	r.waitForPose(t, at(500, 110, 300))
-	test.That(t, r.engine.Status().Haptics.Contact, test.ShouldBeFalse)
-	test.That(t, r.engine.Status().Haptics.Projected, test.ShouldBeGreaterThan, uint64(0))
+	test.That(t, r.engine.Status().Surface.Contact, test.ShouldBeFalse)
+	test.That(t, r.engine.Status().Surface.Held, test.ShouldBeGreaterThan, uint64(0))
 
 	// Stopping removes the constraint from the device.
 	r.stop(t)
@@ -221,7 +217,7 @@ func TestGuardFollowsTheToolsOrientation(t *testing.T) {
 	w := tableWorld(t)
 
 	t.Run("turning while in contact lifts the surface", func(t *testing.T) {
-		g := newGuard(w, hapticCfg())
+		g := newGuard(w)
 		g.update(at(500, 100, 300))
 		g.update(at(500, 100, 240)) // through the table: held at 265
 		test.That(t, g.project(at(500, 100, 240)).Point().Z, test.ShouldAlmostEqual, 265, 1e-6)
@@ -242,7 +238,7 @@ func TestGuardFollowsTheToolsOrientation(t *testing.T) {
 	})
 
 	t.Run("turning into the obstacle from just above it makes contact", func(t *testing.T) {
-		g := newGuard(w, hapticCfg())
+		g := newGuard(w)
 		// 1 mm above the surface, flat: free.
 		g.update(at(500, 100, 266))
 		test.That(t, g.status().Contact, test.ShouldBeFalse)
@@ -254,7 +250,7 @@ func TestGuardFollowsTheToolsOrientation(t *testing.T) {
 	})
 
 	t.Run("a command turned further than the hand is still kept out", func(t *testing.T) {
-		g := newGuard(w, hapticCfg())
+		g := newGuard(w)
 		g.update(at(500, 100, 300))
 		g.update(at(500, 100, 240)) // surface at 265 for a flat tool
 		// The command arrives tilted while the hand's target is flat (the two can differ by
@@ -263,4 +259,35 @@ func TestGuardFollowsTheToolsOrientation(t *testing.T) {
 		d, _, _ := w.Nearest(held)
 		test.That(t, d, test.ShouldAlmostEqual, 5, 1e-3)
 	})
+}
+
+type refusingDevice struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (d *refusingDevice) DoCommand(context.Context, map[string]interface{}) (map[string]interface{}, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls++
+	return nil, errors.New("unknown command")
+}
+
+func TestADeviceThatCannotRenderASurfaceIsLeftAlone(t *testing.T) {
+	dev := &refusingDevice{}
+	g := newGuard(tableWorld(t))
+	s := &hapticSender{dev: dev, g: g}
+	for i := 0; i < 50; i++ {
+		s.send(constraintCommand(r3.Vector{}, r3.Vector{Z: 1}))
+		time.Sleep(time.Millisecond)
+	}
+	s.clear()
+	dev.mu.Lock()
+	calls := dev.calls
+	dev.mu.Unlock()
+	// Five refusals, then nothing more: no constraint each tick, and no clear at the end.
+	test.That(t, calls, test.ShouldEqual, deviceGiveUpAfter)
+	st := g.status()
+	test.That(t, st.Device, test.ShouldBeFalse)
+	test.That(t, st.DeviceError, test.ShouldContainSubstring, "unknown command")
 }

@@ -42,8 +42,8 @@ type Deps struct {
 	LeaderGripper   gripper.Gripper
 	FollowerGripper gripper.Gripper
 	Capture         Commander
-	// Haptics is the hand device, when it can render a surface (a "constraint" DoCommand).
-	// Nil turns surfaces off whatever the config says.
+	// Haptics is the hand device a surface is sent to as a "constraint" DoCommand. Nil when
+	// the source is not a device (a leader arm); the follower is kept out either way.
 	Haptics Commander
 	Logger  logging.Logger
 	Now     func() time.Time
@@ -67,34 +67,34 @@ const (
 
 // Status is a snapshot for DoCommand/CLI reporting.
 type Status struct {
-	Running           bool         `json:"running"` // the follower is being driven
-	SessionID         string       `json:"session_id"`
-	Sessions          uint64       `json:"sessions"`
-	StoppedReason     StopReason   `json:"stopped_reason"`
-	Tracked           bool         `json:"tracked"`
-	LeaderHeld        bool         `json:"leader_held"`
-	LastHoldError     string       `json:"last_hold_error"`
-	Cycles            uint64       `json:"cycles"`
-	Sends             uint64       `json:"sends"`
-	Dropped           uint64       `json:"dropped"`
-	SpeedLimited      uint64       `json:"speed_limited"` // ticks where a speed cap held the follower back
-	Deadzoned         uint64       `json:"deadzoned"`
-	Rejected          uint64       `json:"rejected"`
-	TickOverruns      uint64       `json:"tick_overruns"`
-	ConsecutiveErrors int          `json:"consecutive_errors"`
-	ErrorsTotal       uint64       `json:"errors_total"`
-	LastError         string       `json:"last_error"`
-	LastErrorAt       string       `json:"last_error_at"`
-	LastRPCMs         float64      `json:"last_rpc_ms"`
-	SourceReadMs      float64      `json:"source_read_ms"`
-	GripperReadMs     float64      `json:"gripper_read_ms"`
-	RateHz            float64      `json:"rate_hz"`
-	RotationMode      RotationMode `json:"rotation_mode"`
-	GripperPct        float64      `json:"gripper_pct"`
-	GripperWrites     uint64       `json:"gripper_writes"`
-	PipelineError     string       `json:"pipeline_error"`
-	PipelinePlanMs    float64      `json:"pipeline_plan_ms"`
-	Haptics           HapticStatus `json:"haptics"`
+	Running           bool          `json:"running"` // the follower is being driven
+	SessionID         string        `json:"session_id"`
+	Sessions          uint64        `json:"sessions"`
+	StoppedReason     StopReason    `json:"stopped_reason"`
+	Tracked           bool          `json:"tracked"`
+	LeaderHeld        bool          `json:"leader_held"`
+	LastHoldError     string        `json:"last_hold_error"`
+	Cycles            uint64        `json:"cycles"`
+	Sends             uint64        `json:"sends"`
+	Dropped           uint64        `json:"dropped"`
+	SpeedLimited      uint64        `json:"speed_limited"` // ticks where a speed cap held the follower back
+	Deadzoned         uint64        `json:"deadzoned"`
+	Rejected          uint64        `json:"rejected"`
+	TickOverruns      uint64        `json:"tick_overruns"`
+	ConsecutiveErrors int           `json:"consecutive_errors"`
+	ErrorsTotal       uint64        `json:"errors_total"`
+	LastError         string        `json:"last_error"`
+	LastErrorAt       string        `json:"last_error_at"`
+	LastRPCMs         float64       `json:"last_rpc_ms"`
+	SourceReadMs      float64       `json:"source_read_ms"`
+	GripperReadMs     float64       `json:"gripper_read_ms"`
+	RateHz            float64       `json:"rate_hz"`
+	RotationMode      RotationMode  `json:"rotation_mode"`
+	GripperPct        float64       `json:"gripper_pct"`
+	GripperWrites     uint64        `json:"gripper_writes"`
+	PipelineError     string        `json:"pipeline_error"`
+	PipelinePlanMs    float64       `json:"pipeline_plan_ms"`
+	Surface           SurfaceStatus `json:"surface"`
 }
 
 const (
@@ -145,9 +145,12 @@ type Engine struct {
 	poseLogAt        atomic.Int64
 	frameWarned      map[string]bool
 
-	// guard and haptic are set per session when surfaces are on and could be loaded.
-	guard  *guard
-	haptic *hapticSender
+	// guard and haptic are set per session when the frame system has fixed obstacles and
+	// a shape for the follower.
+	guard          *guard
+	haptic         *hapticSender
+	surfacesWarned bool
+	surfacesLogged bool
 }
 
 // New returns an Engine. It does nothing until Start.
@@ -276,9 +279,7 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 
 	e.guard, e.haptic = nil, nil
-	if e.cfg.Haptics.Enabled {
-		e.startSurfacesLocked(ctx)
-	}
+	e.startSurfacesLocked(ctx)
 
 	e.sessions++
 	e.sessionID = fmt.Sprintf("%d-%d", e.deps.Now().Unix(), e.sessions)
@@ -318,29 +319,43 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
-// startSurfacesLocked loads the obstacles around the follower for this session. A failure
-// leaves surfaces off and is logged: it never stops the clutch from engaging.
+// startSurfacesLocked loads the fixed obstacles around the follower for this session. When
+// there is nothing to load (no frame system, or a follower with no geometry) the session
+// runs as it always has; that is said once, not at every start.
 func (e *Engine) startSurfacesLocked(ctx context.Context) {
 	reader, ok := e.deps.Frames.(surface.Reader)
 	if !ok || e.deps.Frames == nil {
-		e.deps.Logger.Warn("haptics: no frame system to read obstacles from; surfaces are off")
 		return
 	}
 	world, err := surface.Load(ctx, reader, e.deps.Pipeline.Component())
-	if err != nil {
-		e.deps.Logger.Warnf("haptics: %v; surfaces are off for this session", err)
+	if err != nil || len(world.Obstacles) == 0 {
+		if !e.surfacesWarned {
+			e.surfacesWarned = true
+			e.deps.Logger.Infof("the follower is not kept out of fixed obstacles: %v",
+				orNoObstacles(err))
+		}
 		return
 	}
-	e.guard = newGuard(world, e.cfg.Haptics)
+	e.guard = newGuard(world)
 	if e.deps.Haptics != nil {
 		e.haptic = &hapticSender{dev: e.deps.Haptics, g: e.guard}
 	}
-	labels := make([]string, len(world.Obstacles))
-	for i := range world.Obstacles {
-		labels[i] = world.Label(i)
+	if !e.surfacesLogged {
+		e.surfacesLogged = true
+		labels := make([]string, len(world.Obstacles))
+		for i := range world.Obstacles {
+			labels[i] = world.Label(i)
+		}
+		e.deps.Logger.Infow("the follower is kept out of fixed obstacles", "obstacles", labels,
+			"tool_geometries", len(world.Tool))
 	}
-	e.deps.Logger.Infow("haptics: surfaces on", "obstacles", labels, "tool_geometries", len(world.Tool),
-		"device", e.deps.Haptics != nil)
+}
+
+func orNoObstacles(err error) error {
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("the frame system has no fixed obstacles")
 }
 
 // Stop releases: the follower stops where it is. The leader hold is untouched. Stopping a
@@ -449,7 +464,7 @@ func (e *Engine) Status() Status {
 		GripperWrites:     e.out.Writes(),
 		PipelineError:     e.pipelineError,
 		PipelinePlanMs:    e.pipelinePlanMs,
-		Haptics:           e.guard.status(),
+		Surface:           e.guard.status(),
 	}
 	if e.holder != nil {
 		st.LeaderHeld, st.LastHoldError = e.holder.Held(), e.holder.LastError()
@@ -581,7 +596,7 @@ func (e *Engine) tick(ctx context.Context) StopReason {
 			if grd != nil {
 				if p := grd.update(target); p != nil && hap != nil {
 					point, normal := ref.HandPlane(p.point, p.normal, e.cfg.Scale)
-					hap.send(constraintCommand(point, normal, e.cfg.Haptics))
+					hap.send(constraintCommand(point, normal))
 				}
 			}
 			if filtered, pass := f.Step(now, target); pass {
