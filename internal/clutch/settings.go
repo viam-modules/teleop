@@ -62,6 +62,9 @@ type Settings struct {
 	MaxSpeedMMPerSec float64 `json:"max_speed_mm_per_s,omitempty"`     // default 250
 	MaxRotDegPerSec  float64 `json:"max_rotation_deg_per_s,omitempty"` // default 180
 
+	// Haptics keeps the follower out of fixed obstacles and has the hand device render them.
+	Haptics *HapticsSettings `json:"haptics,omitempty"`
+
 	// Leader hold (arm source only). Applied on start, released on stop.
 	LeaderHold            hold.Mode              `json:"leader_hold,omitempty"`
 	ManualMode            map[string]interface{} `json:"manual_mode,omitempty"`
@@ -80,6 +83,15 @@ type Settings struct {
 }
 
 // Vec3 is a JSON-friendly millimetre vector.
+// HapticsSettings is the `haptics` attribute.
+type HapticsSettings struct {
+	Enabled        bool    `json:"enabled"`
+	MarginMM       float64 `json:"margin_mm,omitempty"`         // default 5
+	RangeMM        float64 `json:"range_mm,omitempty"`          // default 80
+	StiffnessNPerM float64 `json:"stiffness_n_per_m,omitempty"` // default 400
+	MaxForceN      float64 `json:"max_force_n,omitempty"`       // default 2.5
+}
+
 type Vec3 struct {
 	X float64 `json:"x"`
 	Y float64 `json:"y"`
@@ -240,6 +252,8 @@ type Config struct {
 
 	MoveTimeout          time.Duration
 	MaxConsecutiveErrors int
+
+	Haptics HapticsConfig
 }
 
 // Resolve turns the settings into an engine Config with every default applied.
@@ -278,6 +292,15 @@ func (s Settings) Resolve() (Config, error) {
 	}
 	if cfg.RotationMode == "" {
 		cfg.RotationMode = RotationAbsolute
+	}
+	if s.Haptics != nil && s.Haptics.Enabled {
+		cfg.Haptics = HapticsConfig{
+			Enabled:        true,
+			MarginMM:       pick(s.Haptics.MarginMM, DefaultHapticMarginMM),
+			RangeMM:        pick(s.Haptics.RangeMM, DefaultHapticRangeMM),
+			StiffnessNPerM: pick(s.Haptics.StiffnessNPerM, DefaultHapticStiffness),
+			MaxForceN:      pick(s.Haptics.MaxForceN, DefaultHapticMaxForceN),
+		}
 	}
 	if s.ToolOrientation != nil {
 		o, err := s.ToolOrientation.ParseConfig()

@@ -154,6 +154,10 @@ func buildEngine(deps resource.Dependencies, frames engine.Frames, p pairs.Pair[
 			return nil, fmt.Errorf("%s: %w", get("pose_tracker", s.PoseTracker), err)
 		}
 		eDeps.Source = &engine.TrackerSource{Tracker: tracker, Name: s.PoseTracker, Body: s.Body}
+		// The tracker is also the device that renders surfaces, when haptics is on.
+		if s.Haptics != nil && s.Haptics.Enabled {
+			eDeps.Haptics = tracker
+		}
 	}
 	motionSvc, err := motion.FromProvider(deps, s.MotionName())
 	if err != nil {
@@ -297,6 +301,13 @@ func (s *service) statusMap(pair string) (map[string]interface{}, error) {
 			"gripper_writes":     st.GripperWrites,
 			"pipeline_error":     st.PipelineError,
 			"pipeline_plan_ms":   st.PipelinePlanMs,
+			"haptics": map[string]interface{}{
+				"enabled":    st.Haptics.Enabled,
+				"obstacle":   st.Haptics.Obstacle,
+				"contact":    st.Haptics.Contact,
+				"projected":  float64(st.Haptics.Projected),
+				"last_error": st.Haptics.LastError,
+			},
 		}
 	}
 	if pair != "" && len(out) == 0 {

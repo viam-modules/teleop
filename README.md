@@ -98,6 +98,7 @@ More in [`examples/clutch-pedal-so101.json`](examples/clutch-pedal-so101.json) a
 | `rot_deadzone_deg`            | float       | No                | Skip targets that turn less than this. Defaults to `3`.                                                                                           |
 | `max_speed_mm_per_s`          | float       | No                | Follower linear speed cap. Cannot be turned off. Defaults to `250`.                                                                               |
 | `max_rotation_deg_per_s`      | float       | No                | Follower angular speed cap. Cannot be turned off. Defaults to `180`.                                                                              |
+| `haptics`                     | object      | No                | Keeps the follower out of fixed obstacles and has the pose tracker render them as surfaces. Pose tracker pairs only. See below.                   |
 | `leader_hold`                 | string      | No                | Arm source: `none`, `manual` or `custom`, applied on configure and released on close. See [Leader hold](#leader-hold). Defaults to `none`.        |
 | `manual_mode`                 | object      | No                | With `manual`: the `extra` map passed to `SetManualMode`.                                                                                         |
 | `leader_commands`             | object      | No                | With `custom`: `before_start`, `after_start`, `on_stop` lists of leader DoCommand payloads.                                                       |
@@ -112,6 +113,28 @@ More in [`examples/clutch-pedal-so101.json`](examples/clutch-pedal-so101.json) a
 | `gripper_invert`              | bool        | No                | Flip the leader percentage. Defaults to `false`.                                                                                                  |
 | `capture_control_sensor`      | string      | No                | Sensor sent `{"start-capture": true}` on `start` and `{"stop-capture": true}` on `stop`.                                                          |
 | `pairs`                       | object[]    | No                | Pairs, each a `name` plus any keys above.                                                                                                         |
+
+`haptics`:
+
+```json
+{ "haptics": { "enabled": true, "margin_mm": 5, "range_mm": 80, "stiffness_n_per_m": 400, "max_force_n": 2.5 } }
+```
+
+| Name | Type | Required | Description |
+| ---- | ---- | -------- | ----------- |
+| `enabled` | bool | Yes | Turns surfaces on. |
+| `margin_mm` | float | No | How far outside the real obstacle the surface sits. Defaults to `5`. |
+| `range_mm` | float | No | Obstacles nearer than this to the follower's tool are sent to the device. Defaults to `80`. |
+| `stiffness_n_per_m` | float | No | Stiffness of the surface at the hand. Defaults to `400`. |
+| `max_force_n` | float | No | Force cap at the hand. Defaults to `2.5`. |
+
+With `haptics` on, each `start` reads the frame system once: the geometry of `follower_component` is the tool, and the geometry of every frame that has no joints above it is an obstacle. Every tick the service measures the tool, at the hand's target, against the nearest obstacle with rdk's distance function. While the tool is outside the margin it works out the surface: the plane the target must stay on one side of. That plane does two jobs:
+
+- The follower's commanded pose is moved back onto it, so the follower slides along the obstacle and the motion planner has nothing to refuse.
+- The plane is converted into the hand's frame and sent to the pose tracker as a `constraint` DoCommand, renewed every tick, so a device that can push back (`viam:haply:pose-tracker`) holds the hand there. A tracker without that command logs an error in `haptics.last_error` and the follower is still kept out.
+
+Limits: one surface at a time, the nearest. Only the tool is checked, and only against obstacles that never move; the planner still checks the rest of the arm, and a refusal from it ends the session as before. A surface the hand has crossed stays in force until the hand comes back across it. A session that starts with the tool already inside an obstacle's margin has no surface until the tool leaves it.
+
 
 Fixed: outlier rejection at 4500 mm/s and 2700 deg/s (accepted after 5 in a row), a 500 ms send timeout, a 3 % gripper deadband.
 
@@ -182,6 +205,7 @@ Returns:
 | `rate_hz` / `rotation_mode`                                            | The configured rate and the current rotation mode.                                        |
 | `gripper_pct` / `gripper_writes`                                       | The last percentage accepted and how many follower writes were issued.                    |
 | `pipeline_error` / `pipeline_plan_ms`                                  | Copied from the motion service's `teleop_status` every 200 ms.                            |
+| `haptics`                                                              | `enabled`, the `obstacle` the current surface belongs to, `contact` (the hand is past it), `projected` (ticks the follower was held on a surface), `last_error`. |
 
 ---
 

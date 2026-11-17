@@ -16,6 +16,7 @@ import (
 	"teleop/internal/hold"
 	"teleop/internal/pipeline"
 	"teleop/internal/posemath"
+	"teleop/internal/surface"
 )
 
 // Frames is the slice of the frame system service the engine needs. framesystem.Service
@@ -41,8 +42,11 @@ type Deps struct {
 	LeaderGripper   gripper.Gripper
 	FollowerGripper gripper.Gripper
 	Capture         Commander
-	Logger          logging.Logger
-	Now             func() time.Time
+	// Haptics is the hand device, when it can render a surface (a "constraint" DoCommand).
+	// Nil turns surfaces off whatever the config says.
+	Haptics Commander
+	Logger  logging.Logger
+	Now     func() time.Time
 }
 
 // StopReason says why the last session ended.
@@ -90,6 +94,7 @@ type Status struct {
 	GripperWrites     uint64       `json:"gripper_writes"`
 	PipelineError     string       `json:"pipeline_error"`
 	PipelinePlanMs    float64      `json:"pipeline_plan_ms"`
+	Haptics           HapticStatus `json:"haptics"`
 }
 
 const (
@@ -139,6 +144,10 @@ type Engine struct {
 	gripperReadNanos atomic.Int64
 	poseLogAt        atomic.Int64
 	frameWarned      map[string]bool
+
+	// guard and haptic are set per session when surfaces are on and could be loaded.
+	guard  *guard
+	haptic *hapticSender
 }
 
 // New returns an Engine. It does nothing until Start.
@@ -266,6 +275,11 @@ func (e *Engine) Start(ctx context.Context) error {
 		return fail(err)
 	}
 
+	e.guard, e.haptic = nil, nil
+	if e.cfg.Haptics.Enabled {
+		e.startSurfacesLocked(ctx)
+	}
+
 	e.sessions++
 	e.sessionID = fmt.Sprintf("%d-%d", e.deps.Now().Unix(), e.sessions)
 	e.ref = NewReference(follower, sample.Pose, rot, sample.Frame)
@@ -304,6 +318,31 @@ func (e *Engine) Start(ctx context.Context) error {
 	return nil
 }
 
+// startSurfacesLocked loads the obstacles around the follower for this session. A failure
+// leaves surfaces off and is logged: it never stops the clutch from engaging.
+func (e *Engine) startSurfacesLocked(ctx context.Context) {
+	reader, ok := e.deps.Frames.(surface.Reader)
+	if !ok || e.deps.Frames == nil {
+		e.deps.Logger.Warn("haptics: no frame system to read obstacles from; surfaces are off")
+		return
+	}
+	world, err := surface.Load(ctx, reader, e.deps.Pipeline.Component())
+	if err != nil {
+		e.deps.Logger.Warnf("haptics: %v; surfaces are off for this session", err)
+		return
+	}
+	e.guard = newGuard(world, e.cfg.Haptics)
+	if e.deps.Haptics != nil {
+		e.haptic = &hapticSender{dev: e.deps.Haptics, g: e.guard}
+	}
+	labels := make([]string, len(world.Obstacles))
+	for i := range world.Obstacles {
+		labels[i] = world.Label(i)
+	}
+	e.deps.Logger.Infow("haptics: surfaces on", "obstacles", labels, "tool_geometries", len(world.Tool),
+		"device", e.deps.Haptics != nil)
+}
+
 // Stop releases: the follower stops where it is. The leader hold is untouched. Stopping a
 // stopped engine does nothing.
 func (e *Engine) Stop(ctx context.Context) error {
@@ -328,6 +367,9 @@ func (e *Engine) closeSessionLocked(ctx context.Context) error {
 	e.sender.Wait()
 	e.out.Wait()
 	e.mu.Lock()
+	if e.haptic != nil {
+		e.haptic.clear()
+	}
 	err := e.unregisterLocked(ctx)
 	e.running = false
 	return err
@@ -407,6 +449,7 @@ func (e *Engine) Status() Status {
 		GripperWrites:     e.out.Writes(),
 		PipelineError:     e.pipelineError,
 		PipelinePlanMs:    e.pipelinePlanMs,
+		Haptics:           e.guard.status(),
 	}
 	if e.holder != nil {
 		st.LeaderHeld, st.LastHoldError = e.holder.Held(), e.holder.LastError()
@@ -460,6 +503,9 @@ func (e *Engine) endOnItsOwn(reason StopReason) {
 	}
 	e.running = false
 	e.stopReason = reason
+	if e.haptic != nil {
+		e.haptic.clear()
+	}
 	e.deps.Logger.Warnf("clutch loop ended (%s): %s; send stop, then start to engage again", reason, e.lastError)
 	_ = e.unregisterLocked(ctx)
 }
@@ -525,11 +571,19 @@ func (e *Engine) tick(ctx context.Context) StopReason {
 
 	if err == nil {
 		e.mu.Lock()
-		ref, mode, f := e.ref, e.rotationMode, e.filter
+		ref, mode, f, grd, hap := e.ref, e.rotationMode, e.filter, e.guard, e.haptic
 		e.mu.Unlock()
 		now := e.deps.Now()
 		if target, ok := ref.Target(sample.Pose, e.cfg.Scale, mode, e.cfg.ToolRotation); ok {
 			e.maybeLogPose(sample.Pose, target)
+			// Surfaces work on the hand's own target, before smoothing and speed caps, so
+			// the device knows the surface before the follower gets near it.
+			if grd != nil {
+				if p := grd.update(target); p != nil && hap != nil {
+					point, normal := ref.HandPlane(p.point, p.normal, e.cfg.Scale)
+					hap.send(constraintCommand(point, normal, e.cfg.Haptics))
+				}
+			}
 			if filtered, pass := f.Step(now, target); pass {
 				e.goal = filtered
 			}
@@ -537,6 +591,11 @@ func (e *Engine) tick(ctx context.Context) StopReason {
 		// The limiter steps every tick toward the latest goal, so a follower that fell behind
 		// a fast hand keeps catching up at the capped speed after the hand stops.
 		if cmd, send := e.limiter.Step(now, e.goal); send {
+			if grd != nil {
+				// The follower is never sent past a surface, so the planner has nothing to
+				// refuse and the session carries on.
+				cmd = grd.project(cmd)
+			}
 			e.sender.TrySend(cmd)
 		}
 		if gerr := e.mirrorGripper(ctx); gerr != nil {
